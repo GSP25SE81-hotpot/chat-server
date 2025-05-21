@@ -1,28 +1,6 @@
 // config/socket.js
 import { Server } from "socket.io";
-import { instrument } from "@socket.io/admin-ui";
-import { createAdapter } from "@socket.io/redis-adapter";
-import { createClient } from "redis";
-import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
-import winston from "winston";
-
-// Configure logger
-const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || "info",
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.Console(),
-    new winston.transports.File({
-      filename: "socket-error.log",
-      level: "error",
-    }),
-    new winston.transports.File({ filename: "socket-combined.log" }),
-  ],
-});
 
 // Track connected clients and their statistics
 const connectedClients = new Map();
@@ -30,13 +8,12 @@ let totalConnections = 0;
 let totalMessages = 0;
 let totalErrors = 0;
 
-// Rate limiting configuration
-const rateLimits = {
-  connection: { points: 10, duration: 60 }, // 10 connections per minute
-  message: { points: 60, duration: 60 }, // 60 messages per minute
-};
+// Connection limits
+const MAX_CONNECTIONS = process.env.MAX_CONNECTIONS
+  ? parseInt(process.env.MAX_CONNECTIONS)
+  : 100;
 
-// Rate limiter implementation
+// Simple rate limiter
 class RateLimiter {
   constructor(points, duration) {
     this.points = points;
@@ -74,100 +51,30 @@ class RateLimiter {
 
     return false;
   }
+
+  // Clean up old entries to prevent memory leaks
+  cleanup() {
+    const now = Date.now();
+    for (const [clientId, data] of this.clients.entries()) {
+      if (now - data.lastRefill > this.duration * 1000 * 2) {
+        this.clients.delete(clientId);
+      }
+    }
+  }
 }
 
-const connectionLimiter = new RateLimiter(
-  rateLimits.connection.points,
-  rateLimits.connection.duration
-);
+// Create rate limiters
+const connectionLimiter = new RateLimiter(5, 60); // 5 connections per minute
+const messageLimiter = new RateLimiter(30, 60); // 30 messages per minute
 
-const messageLimiter = new RateLimiter(
-  rateLimits.message.points,
-  rateLimits.message.duration
-);
-
-// JWT verification function
-const verifyToken = (token) => {
-  try {
-    if (!token) return null;
-    const secret = process.env.JWT_SECRET || "your-fallback-secret-key";
-    return jwt.verify(token, secret);
-  } catch (error) {
-    logger.error(`JWT verification error: ${error.message}`);
-    return null;
-  }
-};
-
-// Socket middleware for authentication
-const authMiddleware = (socket, next) => {
-  try {
-    // Get token from handshake auth or query
-    const token = socket.handshake.auth.token || socket.handshake.query.token;
-
-    // For backward compatibility, allow non-authenticated connections
-    // but mark them as unauthenticated
-    if (!token) {
-      socket.auth = false;
-      socket.userId = null;
-      socket.userRole = null;
-      return next();
-    }
-
-    const decoded = verifyToken(token);
-    if (decoded) {
-      socket.auth = true;
-      socket.userId = decoded.userId;
-      socket.userRole = decoded.role;
-      logger.info(
-        `User ${decoded.userId} authenticated via JWT as ${decoded.role}`
-      );
-    } else {
-      socket.auth = false;
-      socket.userId = null;
-      socket.userRole = null;
-    }
-
-    next();
-  } catch (error) {
-    logger.error(`Auth middleware error: ${error.message}`);
-    next(new Error("Authentication error"));
-  }
-};
-
-// Socket middleware for rate limiting
-const rateLimitMiddleware = (socket, next) => {
-  const clientId = socket.handshake.address;
-
-  if (!connectionLimiter.consume(clientId)) {
-    logger.warn(`Rate limit exceeded for connection from ${clientId}`);
-    return next(new Error("Connection rate limit exceeded"));
-  }
-
-  next();
-};
+// Clean up rate limiters periodically
+setInterval(() => {
+  connectionLimiter.cleanup();
+  messageLimiter.cleanup();
+}, 300000); // Every 5 minutes
 
 export async function initSocketServer(server) {
-  // Redis adapter setup (optional, for scalability)
-  let redisClient;
-  let redisAdapter;
-
-  if (process.env.REDIS_URL) {
-    try {
-      redisClient = createClient({ url: process.env.REDIS_URL });
-      const subClient = redisClient.duplicate();
-
-      await redisClient.connect();
-      await subClient.connect();
-
-      redisAdapter = createAdapter(redisClient, subClient);
-      logger.info("Redis adapter initialized for Socket.IO");
-    } catch (error) {
-      logger.error(`Redis connection failed: ${error.message}`);
-      logger.info("Falling back to in-memory adapter");
-    }
-  }
-
-  // Socket.IO server configuration
+  // Socket.IO server configuration with minimal options
   const io = new Server(server, {
     cors: {
       origin: process.env.ALLOWED_ORIGINS
@@ -176,46 +83,32 @@ export async function initSocketServer(server) {
       methods: ["GET", "POST"],
       credentials: true,
     },
-    pingTimeout: 60000, // 60 seconds ping timeout
+    pingTimeout: 30000, // 30 seconds ping timeout (reduced)
     pingInterval: 25000, // 25 seconds ping interval
-    connectTimeout: 30000, // 30 seconds connection timeout
-    maxHttpBufferSize: 1e6, // 1MB max payload size
+    connectTimeout: 15000, // 15 seconds connection timeout (reduced)
+    maxHttpBufferSize: 100000, // 100KB max payload size (reduced)
     transports: ["websocket", "polling"],
-    allowUpgrades: true,
-    perMessageDeflate: {
-      threshold: 1024, // Compress data if size > 1KB
-    },
-    httpCompression: {
-      threshold: 1024,
-    },
+    perMessageDeflate: false, // Disable compression to save CPU
+    httpCompression: false, // Disable compression to save CPU
     serveClient: false, // Don't serve client files
   });
 
-  // Set up admin UI if enabled
-  if (process.env.SOCKET_ADMIN_UI === "true") {
-    instrument(io, {
-      auth: {
-        type: "basic",
-        username: process.env.SOCKET_ADMIN_USER || "admin",
-        password: process.env.SOCKET_ADMIN_PASS || "admin",
-      },
-    });
-    logger.info("Socket.IO Admin UI enabled");
-  }
+  // Connection limiter middleware
+  io.use((socket, next) => {
+    // Check if we're at max capacity
+    if (io.engine.clientsCount >= MAX_CONNECTIONS) {
+      return next(new Error("Server is at capacity, please try again later"));
+    }
 
-  // Use Redis adapter if available
-  if (redisAdapter) {
-    io.adapter(redisAdapter);
-  }
+    // Apply rate limiting
+    const clientIp = socket.handshake.address;
+    if (!connectionLimiter.consume(clientIp)) {
+      return next(
+        new Error("Too many connection attempts, please try again later")
+      );
+    }
 
-  // Apply middlewares
-  io.use(rateLimitMiddleware);
-  io.use(authMiddleware);
-
-  // Error handling for the server
-  io.engine.on("connection_error", (err) => {
-    totalErrors++;
-    logger.error(`Connection error: ${err.code} ${err.message} ${err.context}`);
+    next();
   });
 
   // Connection handling
@@ -223,249 +116,243 @@ export async function initSocketServer(server) {
     totalConnections++;
     const clientId = socket.id;
     const clientIp = socket.handshake.address;
-    const userAgent = socket.handshake.headers["user-agent"];
 
-    // Store client info
+    // Store minimal client info
     connectedClients.set(clientId, {
       id: clientId,
-      ip: clientIp,
-      userAgent,
-      userId: socket.userId,
-      userRole: socket.userRole,
-      authenticated: socket.auth,
-      connectedAt: new Date(),
+      connectedAt: Date.now(),
       messageCount: 0,
-      errorCount: 0,
     });
 
-    logger.info(`Client connected: ${clientId} from ${clientIp}`, {
-      socketId: clientId,
-      userAgent,
-      authenticated: socket.auth,
-      userId: socket.userId,
-      userRole: socket.userRole,
-    });
+    console.log(`Client connected: ${clientId}`);
 
-    // Legacy authentication method (for backward compatibility)
+    // Authentication
     socket.on("authenticate", (data) => {
       try {
-        logger.info("Authentication request:", data);
-
         // Store user info on socket
         socket.userId = data.userId;
         socket.userRole = data.role;
-        socket.auth = true;
 
         // Update client info
         const clientInfo = connectedClients.get(clientId);
         if (clientInfo) {
           clientInfo.userId = data.userId;
           clientInfo.userRole = data.role;
-          clientInfo.authenticated = true;
         }
 
-        logger.info(`User ${data.userId} authenticated as ${data.role}`);
-
-        // Acknowledge successful authentication
-        socket.emit("authenticated", { success: true });
+        console.log(`User ${data.userId} authenticated as ${data.role}`);
       } catch (error) {
-        logger.error(`Authentication error: ${error.message}`);
-        socket.emit("authenticated", {
-          success: false,
-          error: "Authentication failed",
-        });
+        console.error(`Authentication error: ${error.message}`);
       }
     });
 
-    // Event handler helper with rate limiting and error handling
-    const createEventHandler = (eventName, handler) => {
-      socket.on(eventName, async (...args) => {
-        try {
-          // Apply rate limiting for message events
-          if (!messageLimiter.consume(clientIp)) {
-            logger.warn(
-              `Rate limit exceeded for ${eventName} from ${clientIp}`
-            );
-            socket.emit("error", { message: "Rate limit exceeded" });
-            return;
-          }
-
-          // Track message count
-          totalMessages++;
-          const clientInfo = connectedClients.get(clientId);
-          if (clientInfo) {
-            clientInfo.messageCount++;
-          }
-
-          // Log the event
-          logger.debug(`[EVENT] ${eventName}:`, args);
-
-          // Execute the handler
-          await handler(...args);
-        } catch (error) {
-          totalErrors++;
-
-          // Track error count
-          const clientInfo = connectedClients.get(clientId);
-          if (clientInfo) {
-            clientInfo.errorCount++;
-          }
-
-          logger.error(`Error handling ${eventName}: ${error.message}`, {
-            socketId: clientId,
-            userId: socket.userId,
-            error: error.stack,
-          });
-
-          // Notify client of error
-          socket.emit("error", {
-            message: "Error processing request",
-            event: eventName,
-            requestId: uuidv4(),
-          });
-        }
-      });
-    };
-
-    // Chat events with enhanced error handling and logging
-    createEventHandler("newChatRequest", async (data) => {
-      logger.info("New chat request:", data);
-
-      // Validate data
-      if (!data || !data.sessionId || !data.customerId) {
-        throw new Error("Invalid chat request data");
+    // Chat events with minimal processing
+    socket.on("newChatRequest", (data) => {
+      // Apply rate limiting
+      if (!messageLimiter.consume(clientIp)) {
+        socket.emit("error", { message: "Rate limit exceeded" });
+        return;
       }
 
-      // Add request ID for tracking
-      const requestId = uuidv4();
-      data.requestId = requestId;
+      // Track message count
+      totalMessages++;
+      const clientInfo = connectedClients.get(clientId);
+      if (clientInfo) {
+        clientInfo.messageCount++;
+      }
 
-      // Broadcast to all except sender
+      console.log("New chat request:", data);
       socket.broadcast.emit("newChatRequest", data);
-
-      // Acknowledge receipt
-      socket.emit("newChatRequestAck", {
-        success: true,
-        requestId,
-        sessionId: data.sessionId,
-      });
     });
 
-    createEventHandler("acceptChat", async (data) => {
-      logger.info("Chat accepted:", data);
+    socket.on("acceptChat", (data) => {
+      if (!messageLimiter.consume(clientIp)) return;
 
-      // Validate data
-      if (!data || !data.sessionId || !data.managerId || !data.customerId) {
-        throw new Error("Invalid chat accept data");
+      totalMessages++;
+      console.log("Chat accepted:", data);
+
+      // Create a room for this chat session
+      const roomName = `chat:${data.sessionId}`;
+      socket.join(roomName);
+
+      // Find customer socket and add to room
+      if (data.customerId) {
+        for (const [id, client] of io.sockets.sockets.entries()) {
+          if (client.userId === data.customerId.toString()) {
+            client.join(roomName);
+            break;
+          }
+        }
       }
 
-      // Add timestamp
-      data.acceptedAt = new Date().toISOString();
-
-      // Emit to all clients
       io.emit("chatAccepted", data);
     });
 
-    createEventHandler("sendMessage", async (data) => {
-      logger.info("Message sent:", {
+    socket.on("sendMessage", (data) => {
+      if (!messageLimiter.consume(clientIp)) return;
+
+      totalMessages++;
+      console.log("Message sent:", {
         messageId: data.messageId,
         senderId: data.senderId,
         receiverId: data.receiverId,
       });
 
-      // Validate data
-      if (!data || !data.messageId || !data.senderId || !data.receiverId) {
-        throw new Error("Invalid message data");
+      // If we have a session room, use it
+      const roomName = `chat:${data.sessionId}`;
+      if (io.sockets.adapter.rooms.has(roomName)) {
+        io.to(roomName).emit("receiveMessage", data);
+      } else {
+        io.emit("receiveMessage", data);
       }
-
-      // Add server timestamp
-      data.serverTimestamp = new Date().toISOString();
-
-      // Emit to all clients
-      io.emit("receiveMessage", data);
     });
 
-    createEventHandler("markMessageRead", async (data) => {
-      logger.info("Message marked as read:", data);
+    socket.on("markMessageRead", (data) => {
+      if (!messageLimiter.consume(clientIp)) return;
 
-      // Validate data
-      if (!data || !data.messageId) {
-        throw new Error("Invalid message read data");
-      }
-
-      // Emit to all clients
+      totalMessages++;
+      console.log("Message marked as read:", data.messageId);
       io.emit("messageRead", data.messageId);
     });
 
-    createEventHandler("endChat", async (data) => {
-      logger.info("Chat ended:", data);
+    socket.on("endChat", (data) => {
+      if (!messageLimiter.consume(clientIp)) return;
 
-      // Validate data
-      if (!data || !data.sessionId) {
-        throw new Error("Invalid end chat data");
+      totalMessages++;
+      console.log("Chat ended:", data);
+
+      // Clean up the room
+      const roomName = `chat:${data.sessionId}`;
+      socket.leave(roomName);
+
+      // Notify all clients
+      io.emit("chatEnded", data);
+    });
+
+    // Heartbeat to detect zombie connections
+    socket.on("heartbeat", () => {
+      // Update last activity timestamp
+      const clientInfo = connectedClients.get(clientId);
+      if (clientInfo) {
+        clientInfo.lastActivity = Date.now();
       }
-
-      // Add timestamp
-      data.endedAt = new Date().toISOString();
-
-      // Emit to all clients
-      io.emit("chatEnded", data.sessionId);
     });
 
     // Handle disconnection
     socket.on("disconnect", (reason) => {
       const clientInfo = connectedClients.get(clientId);
       const duration = clientInfo
-        ? (new Date() - clientInfo.connectedAt) / 1000
+        ? (Date.now() - clientInfo.connectedAt) / 1000
         : 0;
+      const messageCount = clientInfo ? clientInfo.messageCount : 0;
 
-      logger.info(
-        `Client disconnected: ${clientId}, Reason: ${reason}, Duration: ${duration}s`,
-        {
-          socketId: clientId,
-          userId: socket.userId,
-          reason,
-          duration,
-          messageCount: clientInfo?.messageCount,
-        }
+      console.log(
+        `Client disconnected: ${clientId}, Reason: ${reason}, Duration: ${duration}s`
       );
 
-      // Remove from connected clients
+      // Clean up client data
       connectedClients.delete(clientId);
+
+      // Leave all rooms
+      Object.keys(socket.rooms).forEach((room) => {
+        if (room !== socket.id) {
+          socket.leave(room);
+        }
+      });
     });
 
-    // Handle errors
+    // Error handling
     socket.on("error", (error) => {
       totalErrors++;
-      logger.error(`Socket error for ${clientId}: ${error.message}`);
-    });
-
-    // Catch all events for logging
-    socket.onAny((event, ...args) => {
-      if (event !== "ping" && event !== "pong") {
-        logger.debug(`[EVENT] ${event}:`, args);
-      }
+      console.error(`Socket error for ${clientId}: ${error.message}`);
     });
   });
 
-  // Health check endpoint
+  // Periodic cleanup of inactive connections
+  const cleanupInterval = setInterval(() => {
+    const now = Date.now();
+    const inactivityThreshold = 5 * 60 * 1000; // 5 minutes
+
+    for (const [id, socket] of io.sockets.sockets.entries()) {
+      const clientInfo = connectedClients.get(id);
+      if (
+        clientInfo &&
+        clientInfo.lastActivity &&
+        now - clientInfo.lastActivity > inactivityThreshold
+      ) {
+        console.log(`Closing inactive connection: ${id}`);
+        socket.disconnect(true);
+      }
+    }
+  }, 60000); // Check every minute
+
+  // Memory pressure handler
+  const memoryCheckInterval = setInterval(() => {
+    const memoryUsage = process.memoryUsage();
+    const memoryThreshold = 450 * 1024 * 1024; // 450MB
+
+    if (memoryUsage.rss > memoryThreshold) {
+      console.warn(
+        `Memory pressure detected: ${Math.round(
+          memoryUsage.rss / 1024 / 1024
+        )}MB`
+      );
+
+      // Notify clients
+      io.emit("server:degraded", { reason: "memory" });
+
+      // Disconnect idle clients if under extreme pressure
+      if (memoryUsage.rss > 480 * 1024 * 1024) {
+        // 480MB
+        console.warn("Extreme memory pressure - disconnecting idle clients");
+        const now = Date.now();
+        let disconnectedCount = 0;
+
+        for (const [id, socket] of io.sockets.sockets.entries()) {
+          const clientInfo = connectedClients.get(id);
+          // Disconnect clients with no authentication or inactive for > 2 minutes
+          if (
+            !socket.userId ||
+            (clientInfo &&
+              clientInfo.lastActivity &&
+              now - clientInfo.lastActivity > 2 * 60 * 1000)
+          ) {
+            socket.disconnect(true);
+            disconnectedCount++;
+
+            // Stop after disconnecting 20% of clients
+            if (disconnectedCount > io.engine.clientsCount * 0.2) break;
+          }
+        }
+
+        console.warn(
+          `Disconnected ${disconnectedCount} idle clients due to memory pressure`
+        );
+
+        // Force garbage collection if available
+        if (global.gc) {
+          global.gc();
+        }
+      }
+    }
+  }, 30000); // Check every 30 seconds
+
+  // Clean up intervals on server close
+  io.on("close", () => {
+    clearInterval(cleanupInterval);
+    clearInterval(memoryCheckInterval);
+  });
+
+  // Return the server instance and utility methods
   return {
     io,
     getStats: () => ({
-      connectedClients: connectedClients.size,
+      connectedClients: io.engine.clientsCount,
       totalConnections,
       totalMessages,
       totalErrors,
       uptime: process.uptime(),
       memory: process.memoryUsage(),
-      clients: Array.from(connectedClients.values()).map((c) => ({
-        id: c.id,
-        userId: c.userId,
-        userRole: c.userRole,
-        authenticated: c.authenticated,
-        connectedAt: c.connectedAt,
-        messageCount: c.messageCount,
-      })),
     }),
   };
 }
