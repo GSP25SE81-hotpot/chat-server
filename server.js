@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import { createServer } from "http";
 import cors from "cors";
@@ -12,24 +11,22 @@ import os from "os";
 // Load environment variables
 dotenv.config();
 
-// Determine if we should use clustering (disabled by default in low memory environments)
+// Performance-optimized clustering
 const ENABLE_CLUSTERING = process.env.ENABLE_CLUSTERING === "true";
-const MAX_WORKERS = process.env.MAX_WORKERS
-  ? parseInt(process.env.MAX_WORKERS)
-  : 2;
-const WORKER_COUNT = ENABLE_CLUSTERING
-  ? Math.min(MAX_WORKERS, os.cpus().length)
-  : 1;
+const MAX_WORKERS =
+  parseInt(process.env.MAX_WORKERS || "0") || Math.max(1, os.cpus().length - 1);
+const WORKER_COUNT = ENABLE_CLUSTERING ? MAX_WORKERS : 1;
 
-// If using cluster and this is the master process
+// Master process for clustering
 if (ENABLE_CLUSTERING && cluster.isMaster) {
-  console.log(`Master ${process.pid} is running`);
+  console.log(`Master ${process.pid} starting ${WORKER_COUNT} workers`);
 
   // Fork workers
   for (let i = 0; i < WORKER_COUNT; i++) {
     cluster.fork();
   }
 
+  // Restart workers if they die
   cluster.on("exit", (worker, code, signal) => {
     console.log(
       `Worker ${worker.process.pid} died (${signal || code}). Restarting...`
@@ -42,16 +39,14 @@ if (ENABLE_CLUSTERING && cluster.isMaster) {
 }
 
 function startServer() {
-  // Simplified logger to reduce memory usage
+  // Optimized logger with minimal overhead
   const logger = winston.createLogger({
-    level: process.env.LOG_LEVEL || "info",
-    format: winston.format.combine(
-      winston.format.timestamp(),
-      winston.format.json()
-    ),
+    level: process.env.NODE_ENV === "production" ? "error" : "info",
+    format: winston.format.json(),
     transports: [
-      new winston.transports.Console(),
-      // Only log errors to file to reduce disk I/O
+      new winston.transports.Console({
+        format: winston.format.simple(),
+      }),
       new winston.transports.File({
         filename: "error.log",
         level: "error",
@@ -59,119 +54,123 @@ function startServer() {
         maxFiles: 2,
       }),
     ],
+    // Reduce logging in production
+    silent:
+      process.env.NODE_ENV === "production" &&
+      process.env.LOG_SILENT === "true",
   });
 
-  // Initialize Express app
+  // Initialize Express app with performance settings
   const app = express();
 
-  // Essential middleware only
-  app.use(compression());
+  // Performance middleware
+  app.use(
+    compression({
+      level: 6, // Balance between CPU and compression ratio
+      threshold: 0, // Compress all responses
+    })
+  );
 
-  // Simplified CORS
+  // Optimized CORS
   app.use(
     cors({
       origin: [
         "http://localhost:5000",
         "https://hpty.vinhuser.one",
-        "https://localhost:7163/",
+        "https://localhost:7163",
       ],
       methods: ["GET", "POST"],
       credentials: true,
+      maxAge: 86400, // Cache preflight requests for 24 hours
     })
   );
 
-  // Minimal JSON parsing with strict limits
-  app.use(express.json({ limit: "25000kb" }));
+  // Efficient JSON parsing
+  app.use(
+    express.json({
+      limit: "1mb",
+      strict: true,
+    })
+  );
 
-  // Basic route for health check
+  // Disable X-Powered-By header
+  app.disable("x-powered-by");
+
+  // Basic route for health check (minimal processing)
   app.get("/", (req, res) => {
-    res.send("Socket.IO server is running");
+    res.send("OK");
   });
 
-  // Memory status check (simplified)
-  app.get("/memory", (req, res) => {
-    const memoryUsage = process.memoryUsage();
-    const usage = {
-      rss: `${Math.round(memoryUsage.rss / 1024 / 1024)}MB`,
-      heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)}MB`,
-      heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)}MB`,
-      external: `${Math.round(memoryUsage.external / 1024 / 1024)}MB`,
-    };
-    res.json(usage);
-  });
-
-  // Create HTTP server
+  // Create HTTP server with optimized settings
   const server = createServer(app);
+
+  // Set TCP keep-alive
+  server.keepAliveTimeout = 65000; // Slightly higher than ALB idle timeout (60s)
+  server.headersTimeout = 66000; // Slightly higher than keepAliveTimeout
 
   // Initialize Socket.IO server
   let socketServer;
   initSocketServer(server)
     .then((result) => {
       socketServer = result;
-      logger.info(
-        `Socket.IO server initialized successfully (Worker: ${process.pid})`
-      );
+      logger.info("Socket.IO server initialized");
     })
     .catch((err) => {
-      logger.error(`Failed to initialize Socket.IO server: ${err.message}`);
+      logger.error(`Socket.IO init error: ${err.message}`);
     });
 
-  // Simplified health check endpoint
+  // Efficient health check endpoint
   app.get("/health", (req, res) => {
-    const memoryUsage = process.memoryUsage();
-    const health = {
-      uptime: process.uptime(),
-      pid: process.pid,
-      memory: {
-        rss: Math.round(memoryUsage.rss / 1024 / 1024),
-        heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024),
-      },
-      connections: socketServer ? socketServer.getStats().connectedClients : 0,
+    const stats = socketServer
+      ? socketServer.getStats()
+      : { status: "initializing" };
+    res.json({
       status: "ok",
-    };
-    res.json(health);
+      connections: stats.connectedClients || 0,
+      uptime: stats.uptime || process.uptime(),
+      memory: {
+        rss: Math.round(process.memoryUsage().rss / 1024 / 1024),
+        heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      },
+    });
   });
 
   // Minimal error handler
   app.use((err, req, res, next) => {
     logger.error(`Error: ${err.message}`);
-    res.status(500).send("Server error");
+    res.status(500).send("Error");
   });
 
   // Start server
   const PORT = process.env.PORT || 3000;
   server.listen(PORT, () => {
-    logger.info(
-      `Socket.IO server running at http://localhost:${PORT}/ (Worker: ${process.pid})`
-    );
+    logger.info(`Server running on port ${PORT} (${process.pid})`);
   });
 
-  // Graceful shutdown
+  // Efficient graceful shutdown
   process.on("SIGTERM", gracefulShutdown);
   process.on("SIGINT", gracefulShutdown);
 
   function gracefulShutdown() {
-    logger.info(`Worker ${process.pid} received shutdown signal`);
+    logger.info(`Worker ${process.pid} shutting down`);
 
-    // Close HTTP server
+    // Set a timeout to force exit
+    const forceExit = setTimeout(() => {
+      process.exit(1);
+    }, 10000);
+
+    // Clear the timeout if we exit normally
+    forceExit.unref();
+
+    // Close server
     server.close(() => {
-      logger.info(`HTTP server closed (Worker: ${process.pid})`);
-
-      // Close Socket.IO connections if available
       if (socketServer && socketServer.io) {
         socketServer.io.close(() => {
-          logger.info(`Socket.IO server closed (Worker: ${process.pid})`);
           process.exit(0);
         });
       } else {
         process.exit(0);
       }
     });
-
-    // Force exit after 5 seconds if graceful shutdown fails
-    setTimeout(() => {
-      logger.error(`Forced shutdown after timeout (Worker: ${process.pid})`);
-      process.exit(1);
-    }, 5000);
   }
 }

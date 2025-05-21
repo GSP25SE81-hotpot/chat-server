@@ -1,215 +1,225 @@
-// config/socket.js
 import { Server } from "socket.io";
-import { v4 as uuidv4 } from "uuid";
 
-// Track connected clients and their statistics
+// Use a more efficient data structure for client tracking
 const connectedClients = new Map();
-let totalConnections = 0;
-let totalMessages = 0;
-let totalErrors = 0;
+let stats = {
+  totalConnections: 0,
+  totalMessages: 0,
+  totalErrors: 0,
+  startTime: Date.now(),
+};
 
-// Connection limits
-const MAX_CONNECTIONS = 100;
+// Performance-tuned connection limits
+const MAX_CONNECTIONS = process.env.MAX_CONNECTIONS || 1000;
+const PING_TIMEOUT = process.env.PING_TIMEOUT || 30000; // 30 seconds
+const PING_INTERVAL = process.env.PING_INTERVAL || 25000; // 25 seconds
+const BUFFER_SIZE = process.env.BUFFER_SIZE || 1e6; // 1MB
 
 export async function initSocketServer(server) {
-  // Socket.IO server configuration with minimal options
+  // Socket.IO server with performance-optimized settings
   const io = new Server(server, {
     cors: {
-      origin: ["http://localhost:5000", "https://hpty.vinhuser.one"],
+      origin: [
+        "http://localhost:5000",
+        "https://hpty.vinhuser.one",
+        "https://localhost:7163",
+      ],
       methods: ["GET", "POST"],
       credentials: true,
     },
-    pingTimeout: 1200000, // 1200 seconds ping timeout (reduced)
-    pingInterval: 2500000, // 2500 seconds ping interval
-    connectTimeout: 1500000, // 1500 seconds connection timeout (reduced)
-    maxHttpBufferSize: 25000000, // 25000KB max payload size (reduced) (25MB)
-    transports: ["websocket", "polling"],
+    // Performance settings
+    pingTimeout: PING_TIMEOUT,
+    pingInterval: PING_INTERVAL,
+    maxHttpBufferSize: BUFFER_SIZE,
+    transports: ["websocket"], // Prefer WebSocket only for better performance
+    allowUpgrades: false, // Disable transport upgrades for stability
+    serveClient: false, // Don't serve client files
+    httpCompression: true, // Enable compression
+    perMessageDeflate: {
+      // Optimize WebSocket compression
+      threshold: 1024, // Only compress messages larger than 1KB
+      zlibDeflateOptions: {
+        // Optimize zlib settings
+        level: 6, // Balance between speed and compression ratio
+        memLevel: 8, // Use more memory for better compression
+        strategy: 0, // Default strategy
+      },
+    },
   });
 
-  // Connection middleware - only check max connections
+  // Efficient connection middleware
   io.use((socket, next) => {
-    // Check if we're at max capacity
+    // Fast connection limit check
     if (io.engine.clientsCount >= MAX_CONNECTIONS) {
-      return next(new Error("Server is at capacity, please try again later"));
+      return next(new Error("Server at capacity"));
     }
     next();
   });
 
   // Connection handling
   io.on("connection", (socket) => {
-    totalConnections++;
+    stats.totalConnections++;
     const clientId = socket.id;
-    const clientIp = socket.handshake.address;
 
-    // Store minimal client info
+    // Store minimal client info (memory efficient)
     connectedClients.set(clientId, {
       id: clientId,
       connectedAt: Date.now(),
-      messageCount: 0,
+      lastActivity: Date.now(),
     });
 
-    console.log(`Client connected: ${clientId}`);
-
-    // Authentication
+    // Authentication - optimized for speed
     socket.on("authenticate", (data) => {
       try {
-        // Store user info on socket
+        // Store only essential user info
         socket.userId = data.userId;
         socket.userRole = data.role;
 
-        // Update client info
+        // Update client tracking with minimal data
         const clientInfo = connectedClients.get(clientId);
         if (clientInfo) {
           clientInfo.userId = data.userId;
           clientInfo.userRole = data.role;
+          clientInfo.lastActivity = Date.now();
         }
 
-        console.log(`User ${data.userId} authenticated as ${data.role}`);
+        // Join role-based room for efficient broadcasting
+        if (data.role) {
+          socket.join(data.role);
+        }
       } catch (error) {
-        console.error(`Authentication error: ${error.message}`);
+        stats.totalErrors++;
+        console.error(`Auth error: ${error.message}`);
       }
     });
 
-    // Chat events with minimal processing
-    socket.on("newChatRequest", (data) => {
-      // Track message count
-      totalMessages++;
-      const clientInfo = connectedClients.get(clientId);
-      if (clientInfo) {
-        clientInfo.messageCount++;
-      }
+    // Event handlers optimized for performance
 
-      console.log("New chat request:", data);
-      socket.broadcast.emit("newChatRequest", data);
+    // New chat event - broadcast to managers only
+    socket.on("newChat", (data) => {
+      stats.totalMessages++;
+      updateActivity(clientId);
+
+      // Efficient targeted broadcast
+      socket.broadcast.to("Manager").emit("newChat", data);
     });
 
-    socket.on("acceptChat", (data) => {
-      totalMessages++;
-      console.log("Chat accepted:", data);
+    // Chat accepted event - direct to specific user
+    socket.on("chatAccepted", (data) => {
+      stats.totalMessages++;
+      updateActivity(clientId);
 
-      // Create a room for this chat session
-      const roomName = `chat:${data.sessionId}`;
-      socket.join(roomName);
-
-      // Find customer socket and add to room
+      // Direct message to customer (more efficient than room)
       if (data.customerId) {
-        for (const [id, client] of io.sockets.sockets.entries()) {
-          if (client.userId === data.customerId.toString()) {
-            client.join(roomName);
-            break;
-          }
+        const targetSocket = findSocketByUserId(io, data.customerId.toString());
+        if (targetSocket) {
+          targetSocket.emit("chatAccepted", data);
+        }
+      }
+    });
+
+    // New message event - direct to specific user
+    socket.on("newMessage", (data) => {
+      stats.totalMessages++;
+      updateActivity(clientId);
+
+      // Direct message to receiver (more efficient than room)
+      if (data.receiverId) {
+        const targetSocket = findSocketByUserId(io, data.receiverId.toString());
+        if (targetSocket) {
+          targetSocket.emit("newMessage", data);
+        }
+      }
+    });
+
+    // Chat ended event - notify specific users
+    socket.on("chatEnded", (data) => {
+      stats.totalMessages++;
+      updateActivity(clientId);
+
+      // Direct messages to specific users
+      if (data.customerId) {
+        const customerSocket = findSocketByUserId(
+          io,
+          data.customerId.toString()
+        );
+        if (customerSocket) {
+          customerSocket.emit("chatEnded", data);
         }
       }
 
-      io.emit("chatAccepted", data);
-    });
-
-    socket.on("sendMessage", (data) => {
-      totalMessages++;
-      console.log("Message sent:", {
-        messageId: data.messageId,
-        senderId: data.senderId,
-        receiverId: data.receiverId,
-      });
-
-      // If we have a session room, use it
-      const roomName = `chat:${data.sessionId}`;
-      if (io.sockets.adapter.rooms.has(roomName)) {
-        io.to(roomName).emit("receiveMessage", data);
-      } else {
-        io.emit("receiveMessage", data);
+      if (data.managerId) {
+        const managerSocket = findSocketByUserId(io, data.managerId.toString());
+        if (managerSocket) {
+          managerSocket.emit("chatEnded", data);
+        }
       }
     });
 
-    socket.on("markMessageRead", (data) => {
-      totalMessages++;
-      console.log("Message marked as read:", data.messageId);
-      io.emit("messageRead", data.messageId);
-    });
-
-    socket.on("endChat", (data) => {
-      totalMessages++;
-      console.log("Chat ended:", data);
-
-      // Clean up the room
-      const roomName = `chat:${data.sessionId}`;
-      socket.leave(roomName);
-
-      // Notify all clients
-      io.emit("chatEnded", data);
-    });
-
-    // Heartbeat to detect zombie connections
+    // Optimized heartbeat
     socket.on("heartbeat", () => {
-      // Update last activity timestamp
-      const clientInfo = connectedClients.get(clientId);
-      if (clientInfo) {
-        clientInfo.lastActivity = Date.now();
-      }
+      updateActivity(clientId);
     });
 
-    // Handle disconnection
-    socket.on("disconnect", (reason) => {
-      const clientInfo = connectedClients.get(clientId);
-      const duration = clientInfo
-        ? (Date.now() - clientInfo.connectedAt) / 1000
-        : 0;
-      const messageCount = clientInfo ? clientInfo.messageCount : 0;
-
-      console.log(
-        `Client disconnected: ${clientId}, Reason: ${reason}, Duration: ${duration}s`
-      );
-
-      // Clean up client data
+    // Efficient disconnect handling
+    socket.on("disconnect", () => {
       connectedClients.delete(clientId);
-
-      // Leave all rooms
-      Object.keys(socket.rooms).forEach((room) => {
-        if (room !== socket.id) {
-          socket.leave(room);
-        }
-      });
     });
 
-    // Error handling
-    socket.on("error", (error) => {
-      totalErrors++;
-      console.error(`Socket error for ${clientId}: ${error.message}`);
+    // Minimal error handling
+    socket.on("error", () => {
+      stats.totalErrors++;
     });
   });
 
-  // Periodic cleanup of inactive connections
-  const cleanupInterval = setInterval(() => {
-    const now = Date.now();
-    const inactivityThreshold = 5 * 60 * 1000; // 5 minutes
+  // Efficient client activity tracking
+  function updateActivity(clientId) {
+    const client = connectedClients.get(clientId);
+    if (client) {
+      client.lastActivity = Date.now();
+    }
+  }
 
-    for (const [id, socket] of io.sockets.sockets.entries()) {
-      const clientInfo = connectedClients.get(id);
-      if (
-        clientInfo &&
-        clientInfo.lastActivity &&
-        now - clientInfo.lastActivity > inactivityThreshold
-      ) {
-        console.log(`Closing inactive connection: ${id}`);
-        socket.disconnect(true);
+  // Efficient socket lookup by user ID
+  function findSocketByUserId(io, userId) {
+    for (const [, socket] of io.sockets.sockets) {
+      if (socket.userId === userId) {
+        return socket;
       }
     }
-  }, 60000); // Check every minute
+    return null;
+  }
 
-  // Clean up intervals on server close
+  // Optimized cleanup interval (less frequent for better performance)
+  const cleanupInterval = setInterval(() => {
+    const now = Date.now();
+    const inactivityThreshold = 60 * 60 * 1000; // 60 minutes
+
+    for (const [id, client] of connectedClients.entries()) {
+      if (now - client.lastActivity > inactivityThreshold) {
+        const socket = io.sockets.sockets.get(id);
+        if (socket) {
+          socket.disconnect(true);
+        }
+        connectedClients.delete(id);
+      }
+    }
+  }, 15 * 60 * 1000); // Run every 15 minutes
+
+  // Clean up on server close
   io.on("close", () => {
     clearInterval(cleanupInterval);
   });
 
-  // Return the server instance and utility methods
+  // Return server and optimized stats function
   return {
     io,
     getStats: () => ({
       connectedClients: io.engine.clientsCount,
-      totalConnections,
-      totalMessages,
-      totalErrors,
-      uptime: process.uptime(),
+      totalConnections: stats.totalConnections,
+      totalMessages: stats.totalMessages,
+      totalErrors: stats.totalErrors,
+      uptime: Math.floor((Date.now() - stats.startTime) / 1000),
       memory: process.memoryUsage(),
     }),
   };
