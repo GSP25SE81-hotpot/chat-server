@@ -3,7 +3,7 @@ import { Server } from "socket.io";
 export function initSocketServer(server) {
   const io = new Server(server, {
     cors: {
-      origin: "http://localhost:5000", // Replace with your client's origin
+      origin: ["http://localhost:5000", "https://hpty.vinhuser.one"], // Add your backend domain
       methods: ["GET", "POST"],
       credentials: true,
     },
