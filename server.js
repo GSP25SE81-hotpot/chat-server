@@ -21,10 +21,6 @@ const WORKER_COUNT = ENABLE_CLUSTERING
   ? Math.min(MAX_WORKERS, os.cpus().length)
   : 1;
 
-// Memory monitoring
-const MEMORY_LIMIT = 450 * 1024 * 1024; // 450MB threshold
-let isUnderMemoryPressure = false;
-
 // If using cluster and this is the master process
 if (ENABLE_CLUSTERING && cluster.isMaster) {
   console.log(`Master ${process.pid} is running`);
@@ -90,7 +86,7 @@ function startServer() {
     res.send("Socket.IO server is running");
   });
 
-  // Memory status check
+  // Memory status check (simplified)
   app.get("/memory", (req, res) => {
     const memoryUsage = process.memoryUsage();
     const usage = {
@@ -98,19 +94,8 @@ function startServer() {
       heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)}MB`,
       heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)}MB`,
       external: `${Math.round(memoryUsage.external / 1024 / 1024)}MB`,
-      percentUsed: `${Math.round(
-        (memoryUsage.rss / (512 * 1024 * 1024)) * 100
-      )}%`,
-      underPressure: isUnderMemoryPressure,
     };
-
     res.json(usage);
-
-    // Attempt garbage collection if available
-    if (global.gc && memoryUsage.rss > MEMORY_LIMIT * 0.8) {
-      global.gc();
-      logger.info("Manual garbage collection triggered");
-    }
   });
 
   // Create HTTP server
@@ -140,9 +125,8 @@ function startServer() {
         heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024),
       },
       connections: socketServer ? socketServer.getStats().connectedClients : 0,
-      status: isUnderMemoryPressure ? "degraded" : "ok",
+      status: "ok",
     };
-
     res.json(health);
   });
 
@@ -160,55 +144,12 @@ function startServer() {
     );
   });
 
-  // Memory monitoring
-  const memoryCheckInterval = setInterval(() => {
-    const memoryUsage = process.memoryUsage();
-
-    // Check if we're approaching memory limits
-    if (memoryUsage.rss > MEMORY_LIMIT) {
-      if (!isUnderMemoryPressure) {
-        isUnderMemoryPressure = true;
-        logger.warn(
-          `Memory pressure detected: ${Math.round(
-            memoryUsage.rss / 1024 / 1024
-          )}MB / 512MB`
-        );
-
-        // Notify Socket.IO to reduce memory usage
-        if (socketServer && socketServer.io) {
-          socketServer.io.emit("server:degraded", { reason: "memory" });
-        }
-
-        // Attempt garbage collection if available
-        if (global.gc) {
-          global.gc();
-        }
-      }
-    } else if (isUnderMemoryPressure && memoryUsage.rss < MEMORY_LIMIT * 0.8) {
-      // Memory pressure has been relieved
-      isUnderMemoryPressure = false;
-      logger.info(
-        `Memory pressure relieved: ${Math.round(
-          memoryUsage.rss / 1024 / 1024
-        )}MB / 512MB`
-      );
-
-      // Notify Socket.IO that server is back to normal
-      if (socketServer && socketServer.io) {
-        socketServer.io.emit("server:normal");
-      }
-    }
-  }, 30000); // Check every 30 seconds
-
   // Graceful shutdown
   process.on("SIGTERM", gracefulShutdown);
   process.on("SIGINT", gracefulShutdown);
 
   function gracefulShutdown() {
     logger.info(`Worker ${process.pid} received shutdown signal`);
-
-    // Clear intervals
-    clearInterval(memoryCheckInterval);
 
     // Close HTTP server
     server.close(() => {

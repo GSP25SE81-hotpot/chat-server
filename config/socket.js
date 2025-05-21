@@ -13,66 +13,6 @@ const MAX_CONNECTIONS = process.env.MAX_CONNECTIONS
   ? parseInt(process.env.MAX_CONNECTIONS)
   : 100;
 
-// Simple rate limiter
-class RateLimiter {
-  constructor(points, duration) {
-    this.points = points;
-    this.duration = duration;
-    this.clients = new Map();
-  }
-
-  consume(clientId) {
-    const now = Date.now();
-    let clientData = this.clients.get(clientId);
-
-    if (!clientData) {
-      clientData = { points: this.points, lastRefill: now };
-      this.clients.set(clientId, clientData);
-      return true;
-    }
-
-    // Refill points based on time elapsed
-    const timePassed = now - clientData.lastRefill;
-    const pointsToAdd =
-      Math.floor(timePassed / 1000) * (this.points / this.duration);
-
-    if (pointsToAdd > 0) {
-      clientData.points = Math.min(
-        this.points,
-        clientData.points + pointsToAdd
-      );
-      clientData.lastRefill = now;
-    }
-
-    if (clientData.points >= 1) {
-      clientData.points -= 1;
-      return true;
-    }
-
-    return false;
-  }
-
-  // Clean up old entries to prevent memory leaks
-  cleanup() {
-    const now = Date.now();
-    for (const [clientId, data] of this.clients.entries()) {
-      if (now - data.lastRefill > this.duration * 1000 * 2) {
-        this.clients.delete(clientId);
-      }
-    }
-  }
-}
-
-// Create rate limiters
-const connectionLimiter = new RateLimiter(5, 60); // 5 connections per minute
-const messageLimiter = new RateLimiter(30, 60); // 30 messages per minute
-
-// Clean up rate limiters periodically
-setInterval(() => {
-  connectionLimiter.cleanup();
-  messageLimiter.cleanup();
-}, 300000); // Every 5 minutes
-
 export async function initSocketServer(server) {
   // Socket.IO server configuration with minimal options
   const io = new Server(server, {
@@ -83,31 +23,19 @@ export async function initSocketServer(server) {
       methods: ["GET", "POST"],
       credentials: true,
     },
-    pingTimeout: 30000, // 30 seconds ping timeout (reduced)
-    pingInterval: 25000, // 25 seconds ping interval
-    connectTimeout: 15000, // 15 seconds connection timeout (reduced)
-    maxHttpBufferSize: 100000, // 100KB max payload size (reduced)
+    pingTimeout: 1200000, // 1200 seconds ping timeout (reduced)
+    pingInterval: 2500000, // 2500 seconds ping interval
+    connectTimeout: 1500000, // 1500 seconds connection timeout (reduced)
+    maxHttpBufferSize: 25000000, // 25000KB max payload size (reduced) (25MB)
     transports: ["websocket", "polling"],
-    perMessageDeflate: false, // Disable compression to save CPU
-    httpCompression: false, // Disable compression to save CPU
-    serveClient: false, // Don't serve client files
   });
 
-  // Connection limiter middleware
+  // Connection middleware - only check max connections
   io.use((socket, next) => {
     // Check if we're at max capacity
     if (io.engine.clientsCount >= MAX_CONNECTIONS) {
       return next(new Error("Server is at capacity, please try again later"));
     }
-
-    // Apply rate limiting
-    const clientIp = socket.handshake.address;
-    if (!connectionLimiter.consume(clientIp)) {
-      return next(
-        new Error("Too many connection attempts, please try again later")
-      );
-    }
-
     next();
   });
 
@@ -148,12 +76,6 @@ export async function initSocketServer(server) {
 
     // Chat events with minimal processing
     socket.on("newChatRequest", (data) => {
-      // Apply rate limiting
-      if (!messageLimiter.consume(clientIp)) {
-        socket.emit("error", { message: "Rate limit exceeded" });
-        return;
-      }
-
       // Track message count
       totalMessages++;
       const clientInfo = connectedClients.get(clientId);
@@ -166,8 +88,6 @@ export async function initSocketServer(server) {
     });
 
     socket.on("acceptChat", (data) => {
-      if (!messageLimiter.consume(clientIp)) return;
-
       totalMessages++;
       console.log("Chat accepted:", data);
 
@@ -189,8 +109,6 @@ export async function initSocketServer(server) {
     });
 
     socket.on("sendMessage", (data) => {
-      if (!messageLimiter.consume(clientIp)) return;
-
       totalMessages++;
       console.log("Message sent:", {
         messageId: data.messageId,
@@ -208,16 +126,12 @@ export async function initSocketServer(server) {
     });
 
     socket.on("markMessageRead", (data) => {
-      if (!messageLimiter.consume(clientIp)) return;
-
       totalMessages++;
       console.log("Message marked as read:", data.messageId);
       io.emit("messageRead", data.messageId);
     });
 
     socket.on("endChat", (data) => {
-      if (!messageLimiter.consume(clientIp)) return;
-
       totalMessages++;
       console.log("Chat ended:", data);
 
@@ -286,61 +200,9 @@ export async function initSocketServer(server) {
     }
   }, 60000); // Check every minute
 
-  // Memory pressure handler
-  const memoryCheckInterval = setInterval(() => {
-    const memoryUsage = process.memoryUsage();
-    const memoryThreshold = 450 * 1024 * 1024; // 450MB
-
-    if (memoryUsage.rss > memoryThreshold) {
-      console.warn(
-        `Memory pressure detected: ${Math.round(
-          memoryUsage.rss / 1024 / 1024
-        )}MB`
-      );
-
-      // Notify clients
-      io.emit("server:degraded", { reason: "memory" });
-
-      // Disconnect idle clients if under extreme pressure
-      if (memoryUsage.rss > 480 * 1024 * 1024) {
-        // 480MB
-        console.warn("Extreme memory pressure - disconnecting idle clients");
-        const now = Date.now();
-        let disconnectedCount = 0;
-
-        for (const [id, socket] of io.sockets.sockets.entries()) {
-          const clientInfo = connectedClients.get(id);
-          // Disconnect clients with no authentication or inactive for > 2 minutes
-          if (
-            !socket.userId ||
-            (clientInfo &&
-              clientInfo.lastActivity &&
-              now - clientInfo.lastActivity > 2 * 60 * 1000)
-          ) {
-            socket.disconnect(true);
-            disconnectedCount++;
-
-            // Stop after disconnecting 20% of clients
-            if (disconnectedCount > io.engine.clientsCount * 0.2) break;
-          }
-        }
-
-        console.warn(
-          `Disconnected ${disconnectedCount} idle clients due to memory pressure`
-        );
-
-        // Force garbage collection if available
-        if (global.gc) {
-          global.gc();
-        }
-      }
-    }
-  }, 30000); // Check every 30 seconds
-
   // Clean up intervals on server close
   io.on("close", () => {
     clearInterval(cleanupInterval);
-    clearInterval(memoryCheckInterval);
   });
 
   // Return the server instance and utility methods
