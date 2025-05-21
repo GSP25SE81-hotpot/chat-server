@@ -23,6 +23,7 @@ export async function initSocketServer(server) {
         "http://localhost:5000",
         "https://hpty.vinhuser.one",
         "https://localhost:7163",
+        "https://hotpot-web-app-production.up.railway.app",
       ],
       methods: ["GET", "POST"],
       credentials: true,
