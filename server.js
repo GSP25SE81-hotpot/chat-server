@@ -12,7 +12,7 @@ const app = express();
 // Configure CORS for the Express app
 app.use(
   cors({
-    origin: "http://localhost:5000", // Replace with your client's origin
+    origin: ["http://localhost:5000", "https://hpty.vinhuser.one"], // Replace with your client's origin
     methods: ["GET", "POST"],
     credentials: true,
   })
