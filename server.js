@@ -98,8 +98,19 @@ function startServer() {
   app.disable("x-powered-by");
 
   // Basic route for health check (minimal processing)
-  app.get("/", (req, res) => {
-    res.send("OK");
+  app.get("/health", (req, res) => {
+    const stats = socketServer
+      ? socketServer.getStats()
+      : { status: "initializing" };
+    res.json({
+      status: "ok",
+      connections: stats.connectedClients || 0,
+      uptime: stats.uptime || process.uptime(),
+      memory: {
+        rss: Math.round(process.memoryUsage().rss / 1024 / 1024),
+        heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      },
+    });
   });
 
   // Create HTTP server with optimized settings
