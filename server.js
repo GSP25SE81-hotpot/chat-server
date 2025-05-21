@@ -70,16 +70,18 @@ function startServer() {
   // Simplified CORS
   app.use(
     cors({
-      origin: process.env.ALLOWED_ORIGINS
-        ? process.env.ALLOWED_ORIGINS.split(",")
-        : ["http://localhost:5000", "https://hpty.vinhuser.one"],
+      origin: [
+        "http://localhost:5000",
+        "https://hpty.vinhuser.one",
+        "https://localhost:7163/",
+      ],
       methods: ["GET", "POST"],
       credentials: true,
     })
   );
 
   // Minimal JSON parsing with strict limits
-  app.use(express.json({ limit: "100kb" }));
+  app.use(express.json({ limit: "25000kb" }));
 
   // Basic route for health check
   app.get("/", (req, res) => {

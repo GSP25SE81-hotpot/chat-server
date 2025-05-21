@@ -9,17 +9,13 @@ let totalMessages = 0;
 let totalErrors = 0;
 
 // Connection limits
-const MAX_CONNECTIONS = process.env.MAX_CONNECTIONS
-  ? parseInt(process.env.MAX_CONNECTIONS)
-  : 100;
+const MAX_CONNECTIONS = 100;
 
 export async function initSocketServer(server) {
   // Socket.IO server configuration with minimal options
   const io = new Server(server, {
     cors: {
-      origin: process.env.ALLOWED_ORIGINS
-        ? process.env.ALLOWED_ORIGINS.split(",")
-        : ["http://localhost:5000", "https://hpty.vinhuser.one"],
+      origin: ["http://localhost:5000", "https://hpty.vinhuser.one"],
       methods: ["GET", "POST"],
       credentials: true,
     },
