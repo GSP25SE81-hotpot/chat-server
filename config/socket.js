@@ -95,12 +95,10 @@ export async function initSocketServer(server) {
     });
 
     // Event handlers optimized for performance
-
     // New chat event - broadcast to managers only
     socket.on("newChat", (data) => {
       stats.totalMessages++;
       updateActivity(clientId);
-
       // Efficient targeted broadcast
       socket.broadcast.to("Manager").emit("newChat", data);
     });
@@ -109,7 +107,6 @@ export async function initSocketServer(server) {
     socket.on("chatAccepted", (data) => {
       stats.totalMessages++;
       updateActivity(clientId);
-
       // Direct message to customer (more efficient than room)
       if (data.customerId) {
         const targetSocket = findSocketByUserId(io, data.customerId.toString());
@@ -123,7 +120,6 @@ export async function initSocketServer(server) {
     socket.on("newMessage", (data) => {
       stats.totalMessages++;
       updateActivity(clientId);
-
       // Direct message to receiver (more efficient than room)
       if (data.receiverId) {
         const targetSocket = findSocketByUserId(io, data.receiverId.toString());
@@ -133,11 +129,18 @@ export async function initSocketServer(server) {
       }
     });
 
+    // New broadcast message event - broadcast to all managers
+    socket.on("newBroadcastMessage", (data) => {
+      stats.totalMessages++;
+      updateActivity(clientId);
+      // Broadcast to all managers
+      socket.broadcast.to("Manager").emit("newBroadcastMessage", data);
+    });
+
     // Chat ended event - notify specific users
     socket.on("chatEnded", (data) => {
       stats.totalMessages++;
       updateActivity(clientId);
-
       // Direct messages to specific users
       if (data.customerId) {
         const customerSocket = findSocketByUserId(
@@ -148,7 +151,6 @@ export async function initSocketServer(server) {
           customerSocket.emit("chatEnded", data);
         }
       }
-
       if (data.managerId) {
         const managerSocket = findSocketByUserId(io, data.managerId.toString());
         if (managerSocket) {
@@ -195,7 +197,6 @@ export async function initSocketServer(server) {
   const cleanupInterval = setInterval(() => {
     const now = Date.now();
     const inactivityThreshold = 60 * 60 * 1000; // 60 minutes
-
     for (const [id, client] of connectedClients.entries()) {
       if (now - client.lastActivity > inactivityThreshold) {
         const socket = io.sockets.sockets.get(id);
